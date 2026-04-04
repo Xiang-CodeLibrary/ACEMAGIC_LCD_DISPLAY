@@ -111,14 +111,19 @@ class LCDDevice:
         self._dev = None
         self._ep = None
 
-    def open(self):
+    def open(self, retries=10, delay=3):
         import usb.core
         import usb.util
 
-        dev = usb.core.find(idVendor=LCD_VID, idProduct=LCD_PID)
-        if dev is None:
+        for attempt in range(retries):
+            dev = usb.core.find(idVendor=LCD_VID, idProduct=LCD_PID)
+            if dev is not None:
+                break
+            if attempt < retries - 1:
+                print(f"等待 LCD 设备就绪... ({attempt + 1}/{retries})", file=sys.stderr)
+                time.sleep(delay)
+        else:
             print("错误: 找不到 ACEMAGIC LCD 设备 (04d9:fd01)", file=sys.stderr)
-            print("请检查 USB 连接, 或用 lsusb 确认设备存在", file=sys.stderr)
             sys.exit(1)
 
         # detach 所有接口的内核驱动
@@ -301,7 +306,7 @@ def cmd_lcd_orient(args):
 
 
 def _get_ip():
-    """获取第一个非 lo 网口的 IPv4 地址"""
+    """获取第一个非 lo 网口的 IPv4 地址和接口名"""
     import psutil
     addrs = psutil.net_if_addrs()
     for iface, addr_list in addrs.items():
@@ -309,8 +314,8 @@ def _get_ip():
             continue
         for addr in addr_list:
             if addr.family.name == "AF_INET" and not addr.address.startswith("127."):
-                return addr.address
-    return "No IP"
+                return iface, addr.address
+    return "N/A", "No IP"
 
 
 def cmd_lcd_sysinfo(args):
@@ -370,9 +375,14 @@ def cmd_lcd_sysinfo(args):
         pass
 
     with LCDDevice() as lcd:
-        lcd.set_time()
+        # 初始化: 密集心跳抑制固件断网提示, 跳过清屏直接画第一帧
+        for _ in range(3):
+            lcd.set_time()
+            time.sleep(0.1)
         lcd.set_orientation(True)
-        lcd.clear()
+        lcd.set_time()
+        # 立刻画一帧纯黑覆盖固件残留
+        lcd.redraw(solid_color_rgb565(5, 5, 15))
         lcd.set_time()
         print(f"系统信息监控中 (间隔 {interval}s), Ctrl+C 退出...")
         try:
@@ -380,7 +390,7 @@ def cmd_lcd_sysinfo(args):
                 lcd.set_time()
                 cpu = psutil.cpu_percent(interval=0.1)
                 mem = psutil.virtual_memory()
-                ip = _get_ip()
+                iface, ip = _get_ip()
 
                 img = Image.new("RGB", (PW, PH), (5, 5, 15))
                 draw = ImageDraw.Draw(img)
@@ -392,8 +402,8 @@ def cmd_lcd_sysinfo(args):
                 gap = 8
                 margin_y = 8
 
-                # IP 框高度: 两行文字(22pt) + 上下留白 = 约 70
-                ip_box_h = 70
+                # IP 框: 接口名 + 两行 IP = 约 95
+                ip_box_h = 95
                 # CPU/RAM 框平分剩余高度
                 big_box_h = (PH - margin_y * 2 - gap * 2 - ip_box_h) // 2
 
@@ -415,6 +425,9 @@ def cmd_lcd_sysinfo(args):
                 # --- IP 框 ---
                 y += big_box_h + gap
                 draw_rounded_rect(draw, [box_margin, y, box_margin + box_w, y + ip_box_h], r, border_color)
+                # 接口名 (顶部)
+                draw.text((cx, y + 10), iface, fill=(60, 120, 220), font=font_label, anchor="mt")
+                # IP 两行 (居中在剩余空间)
                 octets = ip.split(".")
                 if len(octets) == 4:
                     line1 = f"{octets[0]}.{octets[1]}."
@@ -422,8 +435,9 @@ def cmd_lcd_sysinfo(args):
                 else:
                     line1 = ip
                     line2 = ""
-                # 两行文字居中在框内
-                ip_cy = y + ip_box_h // 2
+                ip_top = y + 36
+                ip_area = ip_box_h - 36 - 6
+                ip_cy = ip_top + ip_area // 2
                 draw.text((cx, ip_cy - 13), line1, fill=(255, 255, 255), font=font_ip, anchor="mm")
                 if line2:
                     draw.text((cx, ip_cy + 13), line2, fill=(255, 255, 255), font=font_ip, anchor="mm")
