@@ -11,6 +11,8 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
@@ -61,13 +63,10 @@ def image_to_rgb565(img, rotate=0):
     if rotate:
         img = img.rotate(rotate, expand=True)
     img = img.convert("RGB").resize((LCD_W, LCD_H))
-    pixels = img.tobytes()  # RGBRGB...
-    buf = bytearray(FRAME_SIZE)
-    for i in range(LCD_W * LCD_H):
-        off = i * 3
-        r, g, b = pixels[off], pixels[off + 1], pixels[off + 2]
-        buf[i * 2: i * 2 + 2] = rgb_to_565(r, g, b)
-    return bytes(buf)
+    arr = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(-1, 3)
+    r, g, b = arr[:, 0].astype(np.uint16), arr[:, 1].astype(np.uint16), arr[:, 2].astype(np.uint16)
+    rgb565 = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
+    return rgb565.astype(">u2").tobytes()
 
 
 def solid_color_rgb565(r, g, b):
@@ -444,9 +443,7 @@ def cmd_lcd_sysinfo(args):
 
                 lcd.redraw(image_to_rgb565(img, rotate=90))
                 lcd.set_time()
-                time.sleep(max(0, interval - 0.5))
-                lcd.set_time()
-                time.sleep(0.5)
+                time.sleep(interval)
         except KeyboardInterrupt:
             print("\n已停止")
 
@@ -504,7 +501,7 @@ def main():
 
     # lcd sysinfo
     p = lcd_sub.add_parser("sysinfo", help="实时系统信息")
-    p.add_argument("--interval", type=float, default=2, help="刷新间隔秒数 (默认 2)")
+    p.add_argument("--interval", type=float, default=0.5, help="刷新间隔秒数 (默认 0.5)")
     p.set_defaults(func=cmd_lcd_sysinfo)
 
     # --- led ---
