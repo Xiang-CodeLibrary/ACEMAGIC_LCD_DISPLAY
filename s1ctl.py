@@ -110,6 +110,37 @@ class LCDDevice:
         self._dev = None
         self._ep = None
 
+    def _reset_usb(self, dev):
+        """USB 设备重置, 清除固件残留状态"""
+        try:
+            dev.reset()
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+    def _claim_device(self, dev):
+        """detach 内核驱动并 claim 接口"""
+        import usb.core
+        import usb.util
+
+        for intf_num in range(3):
+            try:
+                if dev.is_kernel_driver_active(intf_num):
+                    dev.detach_kernel_driver(intf_num)
+            except (usb.core.USBError, NotImplementedError):
+                pass
+
+        try:
+            dev.set_configuration()
+        except usb.core.USBError:
+            pass
+        cfg = dev.get_active_configuration()
+        intf = cfg[(LCD_INTF, 0)]
+        ep = usb.util.find_descriptor(
+            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
+        )
+        return ep
+
     def open(self, retries=10, delay=3):
         import usb.core
         import usb.util
@@ -125,23 +156,18 @@ class LCDDevice:
             print("错误: 找不到 ACEMAGIC LCD 设备 (04d9:fd01)", file=sys.stderr)
             sys.exit(1)
 
-        # detach 所有接口的内核驱动
-        for intf_num in range(3):
-            try:
-                if dev.is_kernel_driver_active(intf_num):
-                    dev.detach_kernel_driver(intf_num)
-            except (usb.core.USBError, NotImplementedError):
-                pass
+        # 先重置 USB 设备, 确保干净状态
+        self._reset_usb(dev)
+        # 重置后需要重新查找设备
+        dev = usb.core.find(idVendor=LCD_VID, idProduct=LCD_PID)
+        if dev is None:
+            time.sleep(2)
+            dev = usb.core.find(idVendor=LCD_VID, idProduct=LCD_PID)
+        if dev is None:
+            print("错误: USB 重置后找不到设备", file=sys.stderr)
+            sys.exit(1)
 
-        try:
-            dev.set_configuration()
-        except usb.core.USBError:
-            pass  # 已经是当前 configuration
-        cfg = dev.get_active_configuration()
-        intf = cfg[(LCD_INTF, 0)]
-        ep = usb.util.find_descriptor(
-            intf, custom_match=lambda e: usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT
-        )
+        ep = self._claim_device(dev)
         if ep is None:
             print("错误: 找不到 LCD OUT endpoint", file=sys.stderr)
             sys.exit(1)
@@ -149,6 +175,12 @@ class LCDDevice:
         self._dev = dev
         self._ep = ep
         return self
+
+    def reconnect(self):
+        """重新连接设备 (用于超时恢复)"""
+        self.close()
+        time.sleep(1)
+        return self.open()
 
     def close(self):
         if self._dev:
@@ -165,11 +197,30 @@ class LCDDevice:
 
     def _send(self, header8, data=b""):
         """发送 4104 字节: 8 header + 4096 data (通过 interrupt OUT)"""
+        import usb.core
         buf = bytearray(BUF_SIZE)
         buf[:len(header8)] = header8
         if data:
             buf[8: 8 + len(data)] = data[:CHUNK_DATA]
-        self._ep.write(bytes(buf))
+        for retry in range(3):
+            try:
+                self._ep.write(bytes(buf), timeout=5000)
+                return
+            except usb.core.USBTimeoutError:
+                if retry < 2:
+                    print(f"USB 写入超时, 重试 ({retry + 1}/3)...", file=sys.stderr)
+                    time.sleep(0.5)
+                    try:
+                        self._reset_usb(self._dev)
+                        dev_new = __import__('usb.core', fromlist=['core']).find(
+                            idVendor=LCD_VID, idProduct=LCD_PID)
+                        if dev_new:
+                            self._dev = dev_new
+                            self._ep = self._claim_device(dev_new)
+                    except Exception:
+                        pass
+                else:
+                    raise
 
     def set_orientation(self, landscape=True):
         hdr = bytes([SIG, CMD_CONFIG, SUB_ORIENT, 0x01 if landscape else 0x02, 0, 0, 0, 0])
@@ -373,19 +424,22 @@ def cmd_lcd_sysinfo(args):
     except Exception:
         pass
 
-    with LCDDevice() as lcd:
-        # 初始化: 密集心跳抑制固件断网提示, 跳过清屏直接画第一帧
+    lcd = LCDDevice()
+    lcd.open()
+
+    def lcd_init(lcd):
+        """LCD 初始化: 心跳 + 方向"""
         for _ in range(3):
             lcd.set_time()
             time.sleep(0.1)
         lcd.set_orientation(True)
         lcd.set_time()
-        # 立刻画一帧纯黑覆盖固件残留
-        lcd.redraw(solid_color_rgb565(5, 5, 15))
-        lcd.set_time()
-        print(f"系统信息监控中 (间隔 {interval}s), Ctrl+C 退出...")
-        try:
-            while True:
+
+    lcd_init(lcd)
+    print(f"系统信息监控中 (间隔 {interval}s), Ctrl+C 退出...")
+    try:
+        while True:
+            try:
                 lcd.set_time()
                 cpu = psutil.cpu_percent(interval=0.1)
                 mem = psutil.virtual_memory()
@@ -401,9 +455,7 @@ def cmd_lcd_sysinfo(args):
                 gap = 8
                 margin_y = 8
 
-                # IP 框: 接口名 + 两行 IP = 约 95
                 ip_box_h = 95
-                # CPU/RAM 框平分剩余高度
                 big_box_h = (PH - margin_y * 2 - gap * 2 - ip_box_h) // 2
 
                 # --- CPU 框 ---
@@ -424,9 +476,7 @@ def cmd_lcd_sysinfo(args):
                 # --- IP 框 ---
                 y += big_box_h + gap
                 draw_rounded_rect(draw, [box_margin, y, box_margin + box_w, y + ip_box_h], r, border_color)
-                # 接口名 (顶部)
                 draw.text((cx, y + 10), iface, fill=(60, 120, 220), font=font_label, anchor="mt")
-                # IP 两行 (居中在剩余空间)
                 octets = ip.split(".")
                 if len(octets) == 4:
                     line1 = f"{octets[0]}.{octets[1]}."
@@ -444,8 +494,22 @@ def cmd_lcd_sysinfo(args):
                 lcd.redraw(image_to_rgb565(img, rotate=90))
                 lcd.set_time()
                 time.sleep(interval)
-        except KeyboardInterrupt:
-            print("\n已停止")
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print(f"USB 错误: {e}, 尝试重连...", file=sys.stderr)
+                time.sleep(2)
+                try:
+                    lcd.reconnect()
+                    lcd_init(lcd)
+                    print("重连成功", file=sys.stderr)
+                except Exception as e2:
+                    print(f"重连失败: {e2}, 稍后重试...", file=sys.stderr)
+                    time.sleep(5)
+    except KeyboardInterrupt:
+        print("\n已停止")
+    finally:
+        lcd.close()
 
 
 def cmd_led(args):
